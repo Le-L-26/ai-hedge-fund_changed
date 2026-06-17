@@ -99,14 +99,23 @@ def print_trading_output(result: dict) -> None:
         table_data = sort_agent_signals(table_data)
 
         print(f"\n{Fore.WHITE}{Style.BRIGHT}AGENT ANALYSIS:{Style.RESET_ALL} [{Fore.CYAN}{ticker}{Style.RESET_ALL}]")
-        print(
-            tabulate(
-                table_data,
-                headers=[f"{Fore.WHITE}Agent", "Signal", "Confidence", "Reasoning"],
-                tablefmt="grid",
-                colalign=("left", "center", "right", "left"),
+        if table_data:
+            print(
+                tabulate(
+                    table_data,
+                    headers=[f"{Fore.WHITE}Agent", "Signal", "Confidence", "Reasoning"],
+                    tablefmt="grid",
+                    colalign=("left", "center", "right", "left"),
+                )
             )
-        )
+        else:
+            # No analyst produced a signal for this ticker (commonly because the
+            # data provider returned nothing for it — e.g. tickers outside the
+            # free tier). tabulate() with colalign crashes on empty rows, so guard.
+            print(
+                f"{Fore.YELLOW}No analyst signals for {ticker} "
+                f"(no data returned — the ticker may not be covered by your data plan).{Style.RESET_ALL}"
+            )
 
         # Print Trading Decision Table
         action = decision.get("action", "").upper()
