@@ -10,6 +10,11 @@
     "provider": "Anthropic"
   },
   {
+    "display_name": "Haiku 4.5",
+    "model_name": "claude-haiku-4-5-20251001",
+    "provider": "Anthropic"
+  },
+  {
     "display_name": "Grok 4.3",
     "model_name": "grok-4.3",
     "provider": "xAI"

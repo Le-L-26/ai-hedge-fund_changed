@@ -9,6 +9,7 @@ import pandas as pd
 import numpy as np
 
 from src.tools.api import get_prices, prices_to_df
+from src.utils.market import get_benchmark_returns
 from src.utils.progress import progress
 
 
@@ -49,6 +50,10 @@ def technical_analyst_agent(state: AgentState, agent_id: str = "technical_analys
     # Initialize analysis for each ticker
     technical_analysis = {}
 
+    # Benchmark returns (shared across tickers) so momentum can be measured
+    # relative to the market, not just in absolute terms.
+    benchmark_returns = get_benchmark_returns(start_date, end_date, api_key=api_key)
+
     for ticker in tickers:
         progress.update_status(agent_id, ticker, "Analyzing price data")
 
@@ -74,7 +79,7 @@ def technical_analyst_agent(state: AgentState, agent_id: str = "technical_analys
         mean_reversion_signals = calculate_mean_reversion_signals(prices_df)
 
         progress.update_status(agent_id, ticker, "Calculating momentum")
-        momentum_signals = calculate_momentum_signals(prices_df)
+        momentum_signals = calculate_momentum_signals(prices_df, benchmark_returns)
 
         progress.update_status(agent_id, ticker, "Analyzing volatility")
         volatility_signals = calculate_volatility_signals(prices_df)
@@ -238,9 +243,9 @@ def calculate_mean_reversion_signals(prices_df):
     }
 
 
-def calculate_momentum_signals(prices_df):
+def calculate_momentum_signals(prices_df, benchmark_returns=None):
     """
-    Multi-factor momentum strategy
+    Multi-factor momentum strategy, including relative strength vs a benchmark.
     """
     # Price momentum
     returns = prices_df["close"].pct_change()
@@ -252,21 +257,39 @@ def calculate_momentum_signals(prices_df):
     volume_ma = prices_df["volume"].rolling(21).mean()
     volume_momentum = prices_df["volume"] / volume_ma
 
-    # Relative strength
-    # (would compare to market/sector in real implementation)
-
-    # Calculate momentum score
+    # Absolute momentum score
     momentum_score = (0.4 * mom_1m + 0.3 * mom_3m + 0.3 * mom_6m).iloc[-1]
+
+    # Relative strength: excess return vs the benchmark over the trailing ~3m.
+    # This distinguishes a stock genuinely outperforming its market from one that
+    # is merely riding a rising tide (or being dragged down by a falling one).
+    relative_strength = None
+    if benchmark_returns is not None and len(benchmark_returns) > 0:
+        aligned = pd.concat(
+            [returns.rename("stock"), benchmark_returns.rename("bench")],
+            axis=1, join="inner",
+        ).dropna()
+        if len(aligned) >= 21:
+            window = min(63, len(aligned))
+            stock_cum = aligned["stock"].tail(window).sum()
+            bench_cum = aligned["bench"].tail(window).sum()
+            relative_strength = float(stock_cum - bench_cum)
+
+    # Blend relative strength into the score so cross-sectional outperformance
+    # tilts the signal even when absolute momentum is muted.
+    blended_score = momentum_score
+    if relative_strength is not None:
+        blended_score = 0.7 * momentum_score + 0.3 * relative_strength
 
     # Volume confirmation
     volume_confirmation = volume_momentum.iloc[-1] > 1.0
 
-    if momentum_score > 0.05 and volume_confirmation:
+    if blended_score > 0.05 and volume_confirmation:
         signal = "bullish"
-        confidence = min(abs(momentum_score) * 5, 1.0)
-    elif momentum_score < -0.05 and volume_confirmation:
+        confidence = min(abs(blended_score) * 5, 1.0)
+    elif blended_score < -0.05 and volume_confirmation:
         signal = "bearish"
-        confidence = min(abs(momentum_score) * 5, 1.0)
+        confidence = min(abs(blended_score) * 5, 1.0)
     else:
         signal = "neutral"
         confidence = 0.5
@@ -279,6 +302,7 @@ def calculate_momentum_signals(prices_df):
             "momentum_3m": safe_float(mom_3m.iloc[-1]),
             "momentum_6m": safe_float(mom_6m.iloc[-1]),
             "volume_momentum": safe_float(volume_momentum.iloc[-1]),
+            "relative_strength": safe_float(relative_strength) if relative_strength is not None else None,
         },
     }
 

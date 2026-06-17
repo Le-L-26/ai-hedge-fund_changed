@@ -134,7 +134,11 @@ if __name__ == "__main__":
     inputs = parse_cli_inputs(
         description="Run the hedge fund trading system",
         require_tickers=True,
-        default_months_back=None,
+        # 12 months so the technical analyst's longest lookbacks (momentum_6m =
+        # rolling 126 trading days, vol_regime/stat-arb = rolling 63) have enough
+        # data. A 3-month default left those rolling windows NaN -> 0, silently
+        # killing the technical signal. start/end can still be overridden via CLI.
+        default_months_back=12,
         include_graph_flag=True,
         include_reasoning_flag=True,
     )

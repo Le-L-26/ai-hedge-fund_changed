@@ -15,17 +15,26 @@ from src.utils.api_key import get_api_key_from_state
 from src.tools.api import (
     get_financial_metrics,
     get_market_cap,
+    get_prices,
+    prices_to_df,
     search_line_items,
 )
+from src.utils.market import get_benchmark_returns, estimate_beta
 
 def valuation_analyst_agent(state: AgentState, agent_id: str = "valuation_analyst_agent"):
     """Run valuation across tickers and write signals back to `state`."""
 
     data = state["data"]
     end_date = data["end_date"]
+    start_date = data.get("start_date")
     tickers = data["tickers"]
     api_key = get_api_key_from_state(state, "FINANCIAL_DATASETS_API_KEY")
     valuation_analysis: dict[str, dict] = {}
+
+    # Benchmark returns are shared across tickers for beta estimation.
+    benchmark_returns = (
+        get_benchmark_returns(start_date, end_date, api_key=api_key) if start_date else None
+    )
 
     for ticker in tickers:
         progress.update_status(agent_id, ticker, "Fetching financial data")
@@ -91,7 +100,19 @@ def valuation_analyst_agent(state: AgentState, agent_id: str = "valuation_analys
 
         # Enhanced Discounted Cash Flow with WACC and scenarios
         progress.update_status(agent_id, ticker, "Calculating WACC and enhanced DCF")
-        
+
+        # Estimate beta from the stock's own price history vs the benchmark so the
+        # cost of equity reflects actual risk (a utility ~0.5 vs a biotech ~1.8)
+        # instead of a flat 1.0 for everyone.
+        beta = 1.0
+        if start_date and benchmark_returns is not None:
+            stock_prices = get_prices(ticker, start_date, end_date, api_key=api_key)
+            if stock_prices:
+                stock_df = prices_to_df(stock_prices)
+                if not stock_df.empty and len(stock_df) > 1:
+                    stock_returns = stock_df["close"].pct_change().dropna()
+                    beta = estimate_beta(stock_returns, benchmark_returns)
+
         # Calculate WACC
         wacc = calculate_wacc(
             market_cap=most_recent_metrics.market_cap or 0,
@@ -99,6 +120,7 @@ def valuation_analyst_agent(state: AgentState, agent_id: str = "valuation_analys
             cash=getattr(li_curr, 'cash_and_equivalents', None),
             interest_coverage=most_recent_metrics.interest_coverage,
             debt_to_equity=most_recent_metrics.debt_to_equity,
+            beta_proxy=beta,
         )
         
         # Prepare FCF history for enhanced DCF
@@ -125,6 +147,11 @@ def valuation_analyst_agent(state: AgentState, agent_id: str = "valuation_analys
         # Implied Equity Value
         ev_ebitda_val = calculate_ev_ebitda_value(financial_metrics)
 
+        # EV/Sales fallback — works even when FCF and earnings are negative (deep
+        # cyclicals at a trough, turnarounds), where the cash-flow models collapse
+        # to zero and would otherwise leave us with no valuation at all.
+        ev_sales_val = calculate_ev_sales_value(financial_metrics, getattr(li_curr, "revenue", None))
+
         # Residual Income Model
         rim_val = calculate_residual_income_value(
             market_cap=most_recent_metrics.market_cap,
@@ -142,10 +169,11 @@ def valuation_analyst_agent(state: AgentState, agent_id: str = "valuation_analys
             continue
 
         method_values = {
-            "dcf": {"value": dcf_val, "weight": 0.35},
-            "owner_earnings": {"value": owner_val, "weight": 0.35},
+            "dcf": {"value": dcf_val, "weight": 0.30},
+            "owner_earnings": {"value": owner_val, "weight": 0.30},
             "ev_ebitda": {"value": ev_ebitda_val, "weight": 0.20},
             "residual_income": {"value": rim_val, "weight": 0.10},
+            "ev_sales": {"value": ev_sales_val, "weight": 0.10},
         }
 
         total_weight = sum(v["weight"] for v in method_values.values() if v["value"] > 0)
@@ -161,7 +189,13 @@ def valuation_analyst_agent(state: AgentState, agent_id: str = "valuation_analys
         ) / total_weight
 
         signal = "bullish" if weighted_gap > 0.15 else "bearish" if weighted_gap < -0.15 else "neutral"
-        confidence = round(min(abs(weighted_gap) / 0.30 * 100, 100))
+
+        # Scale confidence by how many of the methods actually produced a value:
+        # a gap derived from a single surviving method is far less reliable than
+        # one corroborated by four, so don't present them with equal conviction.
+        methods_used = sum(1 for v in method_values.values() if v["value"] > 0)
+        coverage = methods_used / len(method_values)
+        confidence = round(min(abs(weighted_gap) / 0.30 * 100, 100) * coverage)
 
         # Enhanced reasoning with DCF scenario details
         reasoning = {}
@@ -194,11 +228,20 @@ def valuation_analyst_agent(state: AgentState, agent_id: str = "valuation_analys
         if 'dcf_results' in locals():
             reasoning["dcf_scenario_analysis"] = {
                 "bear_case": f"${dcf_results['downside']:,.2f}",
-                "base_case": f"${dcf_results['scenarios']['base']:,.2f}",  
+                "base_case": f"${dcf_results['scenarios']['base']:,.2f}",
                 "bull_case": f"${dcf_results['upside']:,.2f}",
                 "wacc_used": f"{wacc:.1%}",
                 "fcf_periods_analyzed": len(fcf_history)
             }
+
+        # Surface the risk/coverage inputs so a thin valuation is visible.
+        reasoning["valuation_coverage"] = {
+            "beta_used": round(beta, 2),
+            "wacc_used": f"{wacc:.1%}",
+            "methods_used": methods_used,
+            "methods_total": len(method_values),
+            "coverage": f"{coverage:.0%}",
+        }
 
         valuation_analysis[ticker] = {
             "signal": signal,
@@ -295,6 +338,28 @@ def calculate_ev_ebitda_value(financial_metrics: list):
         m.enterprise_value_to_ebitda_ratio for m in financial_metrics if m.enterprise_value_to_ebitda_ratio
     ])
     ev_implied = med_mult * ebitda_now
+    net_debt = (m0.enterprise_value or 0) - (m0.market_cap or 0)
+    return max(ev_implied - net_debt, 0)
+
+
+def calculate_ev_sales_value(financial_metrics: list, revenue_curr: float | None):
+    """Implied equity value via median EV/Sales multiple.
+
+    Resilient to negative earnings/FCF, so it provides a valuation anchor for
+    cyclicals at a trough and turnarounds where the cash-flow models return 0.
+    """
+    if not financial_metrics or not revenue_curr or revenue_curr <= 0:
+        return 0
+    m0 = financial_metrics[0]
+    mults = [
+        m.enterprise_value_to_revenue_ratio
+        for m in financial_metrics
+        if m.enterprise_value_to_revenue_ratio and m.enterprise_value_to_revenue_ratio > 0
+    ]
+    if not mults:
+        return 0
+    med_mult = statistics.median(mults)
+    ev_implied = med_mult * revenue_curr
     net_debt = (m0.enterprise_value or 0) - (m0.market_cap or 0)
     return max(ev_implied - net_debt, 0)
 

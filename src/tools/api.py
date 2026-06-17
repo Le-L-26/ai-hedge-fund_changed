@@ -19,11 +19,17 @@ from src.data.models import (
     LineItemResponse,
     InsiderTrade,
     InsiderTradeResponse,
+    CompanyFacts,
     CompanyFactsResponse,
 )
 
 # Global cache instance
 _cache = get_cache()
+
+# In-process memo for company facts (sector/industry). Several agents request the
+# same ticker's sector within one run; this avoids redundant API calls without
+# needing a persisted cache layer.
+_company_facts_cache: dict[str, "CompanyFacts | None"] = {}
 
 
 def _make_api_request(url: str, headers: dict, method: str = "GET", json_data: dict = None, max_retries: int = 3) -> requests.Response:
@@ -312,29 +318,61 @@ def get_company_news(
     return all_news
 
 
+def get_company_facts(ticker: str, api_key: str = None) -> CompanyFacts | None:
+    """Fetch company facts (sector, industry, market cap, ...), memoized per run."""
+    if ticker in _company_facts_cache:
+        return _company_facts_cache[ticker]
+
+    headers = {}
+    financial_api_key = api_key or os.environ.get("FINANCIAL_DATASETS_API_KEY")
+    if financial_api_key:
+        headers["X-API-KEY"] = financial_api_key
+
+    url = f"https://api.financialdatasets.ai/company/facts/?ticker={ticker}"
+    response = _make_api_request(url, headers)
+    if response.status_code != 200:
+        _company_facts_cache[ticker] = None
+        return None
+
+    try:
+        facts = CompanyFactsResponse(**response.json()).company_facts
+    except Exception as e:
+        logger.warning("Failed to parse company facts for %s: %s", ticker, e)
+        facts = None
+
+    _company_facts_cache[ticker] = facts
+    return facts
+
+
+def get_sector_bucket(ticker: str, api_key: str = None) -> str:
+    """Return the normalized sector bucket (see utils.sectors) for a ticker."""
+    from src.utils.sectors import normalize_sector, DEFAULT
+
+    facts = get_company_facts(ticker, api_key=api_key)
+    if not facts:
+        return DEFAULT
+    return normalize_sector(facts.sector or facts.sic_sector, facts.industry or facts.sic_industry)
+
+
 def get_market_cap(
     ticker: str,
     end_date: str,
     api_key: str = None,
 ) -> float | None:
-    """Fetch market cap from the API."""
-    # Check if end_date is today
+    """Fetch market cap from the API.
+
+    For a current-day request the company/facts endpoint gives the freshest
+    figure, but it can return None (e.g., not covered on the free tier). In that
+    case we fall back to the market cap reported in financial metrics rather than
+    giving up — otherwise downstream agents (valuation) bail entirely on a value
+    that is actually available.
+    """
+    # Prefer the live company-facts figure when asking for today.
     if end_date == datetime.datetime.now().strftime("%Y-%m-%d"):
-        # Get the market cap from company facts API
-        headers = {}
-        financial_api_key = api_key or os.environ.get("FINANCIAL_DATASETS_API_KEY")
-        if financial_api_key:
-            headers["X-API-KEY"] = financial_api_key
-
-        url = f"https://api.financialdatasets.ai/company/facts/?ticker={ticker}"
-        response = _make_api_request(url, headers)
-        if response.status_code != 200:
-            print(f"Error fetching company facts: {ticker} - {response.status_code}")
-            return None
-
-        data = response.json()
-        response_model = CompanyFactsResponse(**data)
-        return response_model.company_facts.market_cap
+        facts = get_company_facts(ticker, api_key=api_key)
+        if facts and facts.market_cap:
+            return facts.market_cap
+        # else: fall through to the financial-metrics fallback below
 
     financial_metrics = get_financial_metrics(ticker, end_date, api_key=api_key)
     if not financial_metrics:
