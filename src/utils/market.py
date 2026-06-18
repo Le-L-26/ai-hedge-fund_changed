@@ -11,14 +11,28 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from src.tools import cn_data
 from src.tools.api import get_prices, prices_to_df
 
 # Broad-market proxy. Override via the env if desired later.
 BENCHMARK_TICKER = "SPY"
 
 
-def get_benchmark_returns(start_date: str, end_date: str, api_key: str | None = None) -> pd.Series | None:
-    """Daily close-to-close returns for the benchmark over the window, or None."""
+def get_benchmark_returns(
+    start_date: str,
+    end_date: str,
+    api_key: str | None = None,
+    tickers: list[str] | None = None,
+) -> pd.Series | None:
+    """Daily close-to-close returns for the benchmark over the window, or None.
+
+    Picks the benchmark from the universe being analyzed: A-share tickers use the
+    CSI 300 index, everything else uses SPY. (A run is normally single-market; if
+    mixed, A-shares present at all switch the shared benchmark to CSI 300.)
+    """
+    if tickers and any(cn_data.is_cn_ticker(t) for t in tickers):
+        return cn_data.get_benchmark_returns(start_date, end_date)
+
     prices = get_prices(BENCHMARK_TICKER, start_date, end_date, api_key=api_key)
     if not prices:
         return None

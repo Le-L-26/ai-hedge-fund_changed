@@ -52,7 +52,7 @@ def technical_analyst_agent(state: AgentState, agent_id: str = "technical_analys
 
     # Benchmark returns (shared across tickers) so momentum can be measured
     # relative to the market, not just in absolute terms.
-    benchmark_returns = get_benchmark_returns(start_date, end_date, api_key=api_key)
+    benchmark_returns = get_benchmark_returns(start_date, end_date, api_key=api_key, tickers=tickers)
 
     for ticker in tickers:
         progress.update_status(agent_id, ticker, "Analyzing price data")

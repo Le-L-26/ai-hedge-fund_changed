@@ -24,14 +24,21 @@ CONSUMER_STAPLES = "consumer_staples"
 
 # Substring matchers against the raw sector/industry strings from company facts.
 # Order matters: first match wins, so put the most specific buckets first.
+# Matchers run against the lowercased sector/industry string. Both English
+# (financialdatasets.ai) and Chinese (akshare CSRC industry) labels are included
+# so A-share names bucket correctly; Chinese substrings are unaffected by .lower().
 _SECTOR_KEYWORDS: list[tuple[str, tuple[str, ...]]] = [
-    (REAL_ESTATE, ("reit", "real estate", "mortgage real estate")),
+    (REAL_ESTATE, ("reit", "real estate", "mortgage real estate", "房地产")),
     (FINANCIALS, ("financ", "bank", "insurance", "capital markets", "asset management",
-                  "credit", "thrift", "brokerage")),
-    (UTILITIES, ("utilit", "electric", "water utilit", "gas utilit", "power")),
-    (ENERGY, ("energy", "oil", "gas", "petroleum", "drilling", "pipeline", "coal")),
+                  "credit", "thrift", "brokerage",
+                  "金融", "银行", "保险", "证券", "信托", "货币")),
+    (UTILITIES, ("utilit", "electric", "water utilit", "gas utilit", "power",
+                 "电力", "热力", "燃气", "水的生产", "供水")),
+    (ENERGY, ("energy", "oil", "gas", "petroleum", "drilling", "pipeline", "coal",
+              "石油", "天然气", "煤炭", "采矿", "开采")),
     (CONSUMER_STAPLES, ("consumer staples", "consumer defensive", "food", "beverage",
-                        "household", "tobacco", "grocery")),
+                        "household", "tobacco", "grocery",
+                        "食品", "饮料", "酒", "烟草", "农副", "日用")),
 ]
 
 

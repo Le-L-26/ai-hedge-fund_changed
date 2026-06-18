@@ -33,7 +33,7 @@ def valuation_analyst_agent(state: AgentState, agent_id: str = "valuation_analys
 
     # Benchmark returns are shared across tickers for beta estimation.
     benchmark_returns = (
-        get_benchmark_returns(start_date, end_date, api_key=api_key) if start_date else None
+        get_benchmark_returns(start_date, end_date, api_key=api_key, tickers=tickers) if start_date else None
     )
 
     for ticker in tickers:

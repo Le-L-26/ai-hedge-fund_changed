@@ -8,6 +8,7 @@ import time
 logger = logging.getLogger(__name__)
 
 from src.data.cache import get_cache
+from src.tools import cn_data
 from src.data.models import (
     CompanyNews,
     CompanyNewsResponse,
@@ -68,6 +69,8 @@ def _make_api_request(url: str, headers: dict, method: str = "GET", json_data: d
 
 def get_prices(ticker: str, start_date: str, end_date: str, api_key: str = None) -> list[Price]:
     """Fetch price data from cache or API."""
+    if cn_data.is_cn_ticker(ticker):
+        return cn_data.get_prices(ticker, start_date, end_date)
     # Create a cache key that includes all parameters to ensure exact matches
     cache_key = f"{ticker}_{start_date}_{end_date}"
     
@@ -110,6 +113,8 @@ def get_financial_metrics(
     api_key: str = None,
 ) -> list[FinancialMetrics]:
     """Fetch financial metrics from cache or API."""
+    if cn_data.is_cn_ticker(ticker):
+        return cn_data.get_financial_metrics(ticker, end_date, period=period, limit=limit)
     # Create a cache key that includes all parameters to ensure exact matches
     cache_key = f"{ticker}_{period}_{end_date}_{limit}"
     
@@ -153,6 +158,8 @@ def search_line_items(
     api_key: str = None,
 ) -> list[LineItem]:
     """Fetch line items from API."""
+    if cn_data.is_cn_ticker(ticker):
+        return cn_data.search_line_items(ticker, line_items, end_date, period=period, limit=limit)
     # If not in cache or insufficient data, fetch from API
     headers = {}
     financial_api_key = api_key or os.environ.get("FINANCIAL_DATASETS_API_KEY")
@@ -194,6 +201,8 @@ def get_insider_trades(
     api_key: str = None,
 ) -> list[InsiderTrade]:
     """Fetch insider trades from cache or API."""
+    if cn_data.is_cn_ticker(ticker):
+        return cn_data.get_insider_trades(ticker, end_date, start_date=start_date, limit=limit)
     # Create a cache key that includes all parameters to ensure exact matches
     cache_key = f"{ticker}_{start_date or 'none'}_{end_date}_{limit}"
     
@@ -260,6 +269,8 @@ def get_company_news(
     api_key: str = None,
 ) -> list[CompanyNews]:
     """Fetch company news from cache or API."""
+    if cn_data.is_cn_ticker(ticker):
+        return cn_data.get_company_news(ticker, end_date, start_date=start_date, limit=limit)
     # Create a cache key that includes all parameters to ensure exact matches
     cache_key = f"{ticker}_{start_date or 'none'}_{end_date}_{limit}"
     
@@ -323,6 +334,11 @@ def get_company_facts(ticker: str, api_key: str = None) -> CompanyFacts | None:
     if ticker in _company_facts_cache:
         return _company_facts_cache[ticker]
 
+    if cn_data.is_cn_ticker(ticker):
+        facts = cn_data.get_company_facts(ticker)
+        _company_facts_cache[ticker] = facts
+        return facts
+
     headers = {}
     financial_api_key = api_key or os.environ.get("FINANCIAL_DATASETS_API_KEY")
     if financial_api_key:
@@ -367,6 +383,9 @@ def get_market_cap(
     giving up — otherwise downstream agents (valuation) bail entirely on a value
     that is actually available.
     """
+    if cn_data.is_cn_ticker(ticker):
+        return cn_data.get_market_cap(ticker, end_date)
+
     # Prefer the live company-facts figure when asking for today.
     if end_date == datetime.datetime.now().strftime("%Y-%m-%d"):
         facts = get_company_facts(ticker, api_key=api_key)
