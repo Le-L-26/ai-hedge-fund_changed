@@ -6,6 +6,7 @@ import json
 
 from src.tools.api import get_financial_metrics, get_sector_bucket
 from src.utils.sectors import get_thresholds, is_leveraged_by_design, fcf_meaningful
+from src.utils.quant import signed_score, aggregate
 
 
 ##### Fundamental Agent #####
@@ -42,15 +43,13 @@ def fundamentals_analyst_agent(state: AgentState, agent_id: str = "fundamentals_
         sector = get_sector_bucket(ticker, api_key=api_key)
         sector_thresholds = get_thresholds(sector)
 
-        # Track how many underlying data points were actually available so we can
-        # scale confidence down for thin-data names instead of presenting an
-        # incomplete read with the same conviction as a fully-covered one.
-        available_fields = 0
-        total_fields = 0
-
-        # Initialize signals list for different fundamental aspects
-        signals = []
         reasoning = {}
+        # Each pillar produces a continuous signed score in (-1, 1) via tanh around
+        # the sector threshold (the old binary "metric > threshold" cliffs threw
+        # away magnitude). Pillar verdicts then aggregate into the overall read,
+        # whose conviction is the magnitude of the net score, not a vote count.
+        pillar_scores: list[float | None] = []
+        pillar_weights: list[float] = []
 
         progress.update_status(agent_id, ticker, "Analyzing profitability")
         # 1. Profitability Analysis (sector-adjusted)
@@ -59,18 +58,16 @@ def fundamentals_analyst_agent(state: AgentState, agent_id: str = "fundamentals_
         operating_margin = metrics.operating_margin
 
         prof_t = sector_thresholds["profitability"]
-        thresholds = [
-            (return_on_equity, prof_t["roe"]),
-            (net_margin, prof_t["net_margin"]),
-            (operating_margin, prof_t["operating_margin"]),
-        ]
-        total_fields += len(thresholds)
-        available_fields += sum(metric is not None for metric, _ in thresholds)
-        profitability_score = sum(metric is not None and metric > threshold for metric, threshold in thresholds)
-
-        signals.append("bullish" if profitability_score >= 2 else "bearish" if profitability_score == 0 else "neutral")
+        prof = aggregate([
+            signed_score(return_on_equity, prof_t["roe"]),
+            signed_score(net_margin, prof_t["net_margin"]),
+            signed_score(operating_margin, prof_t["operating_margin"]),
+        ])
+        pillar_scores.append(prof.score if prof.coverage else None)
+        pillar_weights.append(1.0)
         reasoning["profitability_signal"] = {
-            "signal": signals[0],
+            "signal": prof.signal,
+            "score": round(prof.score, 3),
             "details": (f"ROE: {return_on_equity:.2%}" if return_on_equity else "ROE: N/A") + ", " + (f"Net Margin: {net_margin:.2%}" if net_margin else "Net Margin: N/A") + ", " + (f"Op Margin: {operating_margin:.2%}" if operating_margin else "Op Margin: N/A"),
         }
 
@@ -81,115 +78,88 @@ def fundamentals_analyst_agent(state: AgentState, agent_id: str = "fundamentals_
         book_value_growth = metrics.book_value_growth
 
         growth_t = sector_thresholds["growth"]
-        thresholds = [
-            (revenue_growth, growth_t["revenue"]),
-            (earnings_growth, growth_t["earnings"]),
-            (book_value_growth, growth_t["book_value"]),
-        ]
-        total_fields += len(thresholds)
-        available_fields += sum(metric is not None for metric, _ in thresholds)
-        growth_score = sum(metric is not None and metric > threshold for metric, threshold in thresholds)
-
-        signals.append("bullish" if growth_score >= 2 else "bearish" if growth_score == 0 else "neutral")
+        growth = aggregate([
+            signed_score(revenue_growth, growth_t["revenue"]),
+            signed_score(earnings_growth, growth_t["earnings"]),
+            signed_score(book_value_growth, growth_t["book_value"]),
+        ])
+        pillar_scores.append(growth.score if growth.coverage else None)
+        pillar_weights.append(1.0)
         reasoning["growth_signal"] = {
-            "signal": signals[1],
+            "signal": growth.signal,
+            "score": round(growth.score, 3),
             "details": (f"Revenue Growth: {revenue_growth:.2%}" if revenue_growth else "Revenue Growth: N/A") + ", " + (f"Earnings Growth: {earnings_growth:.2%}" if earnings_growth else "Earnings Growth: N/A"),
         }
 
         progress.update_status(agent_id, ticker, "Analyzing financial health")
-        # 3. Financial Health (sector-adjusted)
+        # 3. Financial Health (sector-adjusted). Checks that don't apply to the
+        # sector are left out (weight 0) rather than scored, mirroring the prior
+        # leverage/FCF applicability logic.
         current_ratio = metrics.current_ratio
         debt_to_equity = metrics.debt_to_equity
         free_cash_flow_per_share = metrics.free_cash_flow_per_share
         earnings_per_share = metrics.earnings_per_share
 
-        # Count the checks that actually apply to this sector so the score can be
-        # judged against the right denominator.
-        health_checks = 0
-        health_score = 0
-        if current_ratio is not None:
-            total_fields += 1
-            available_fields += 1
-        if current_ratio and current_ratio > 1.5:  # Strong liquidity
-            health_score += 1
-        health_checks += 1
+        health_scores = [signed_score(current_ratio, 1.5, scale=0.75)]
+        health_weights = [1.0]
 
-        # Low-debt bonus only for sectors where low leverage is meaningful.
-        # Banks, utilities, and REITs are levered by design; penalizing them here
-        # would be wrong, so the check is skipped for them.
-        if not is_leveraged_by_design(sector):
-            health_checks += 1
-            if debt_to_equity is not None:
-                total_fields += 1
-                available_fields += 1
-            if debt_to_equity is not None and debt_to_equity < 0.5:  # Conservative debt
-                health_score += 1
+        # Low-debt is only meaningful where low leverage is a virtue. Banks,
+        # utilities and REITs are levered by design, so the check is dropped.
+        health_scores.append(signed_score(debt_to_equity, 0.5, scale=0.4, higher_is_better=False))
+        health_weights.append(0.0 if is_leveraged_by_design(sector) else 1.0)
 
-        # FCF conversion is not a meaningful check for financials/REITs.
-        if fcf_meaningful(sector):
-            health_checks += 1
-            if free_cash_flow_per_share and earnings_per_share and free_cash_flow_per_share > earnings_per_share * 0.8:
-                health_score += 1
+        # FCF-to-earnings conversion is not meaningful for financials/REITs.
+        fcf_conv = (free_cash_flow_per_share / earnings_per_share) if (free_cash_flow_per_share and earnings_per_share) else None
+        health_scores.append(signed_score(fcf_conv, 0.8, scale=0.4))
+        health_weights.append(1.0 if fcf_meaningful(sector) else 0.0)
 
-        # Require a majority of the *applicable* checks to call it bullish.
-        bullish_health_cut = max(2, (health_checks // 2) + 1)
-        health_signal = "bullish" if health_score >= bullish_health_cut else "bearish" if health_score == 0 else "neutral"
-        signals.append(health_signal)
+        health = aggregate(health_scores, health_weights)
+        pillar_scores.append(health.score if health.coverage else None)
+        pillar_weights.append(1.0)
         reasoning["financial_health_signal"] = {
-            "signal": signals[2],
+            "signal": health.signal,
+            "score": round(health.score, 3),
             "details": (f"Current Ratio: {current_ratio:.2f}" if current_ratio else "Current Ratio: N/A") + ", " + (f"D/E: {debt_to_equity:.2f}" if debt_to_equity else "D/E: N/A") + (" (leverage check skipped: levered-by-design sector)" if is_leveraged_by_design(sector) else ""),
         }
 
         progress.update_status(agent_id, ticker, "Analyzing valuation ratios")
-        # 4. Price to X ratios (sector-adjusted)
+        # 4. Price to X ratios (sector-adjusted). Richer-than-threshold is bearish,
+        # so these score with higher_is_better=False.
         pe_ratio = metrics.price_to_earnings_ratio
         pb_ratio = metrics.price_to_book_ratio
         ps_ratio = metrics.price_to_sales_ratio
 
         price_t = sector_thresholds["price"]
-        thresholds = [
-            (pe_ratio, price_t["pe"]),
-            (pb_ratio, price_t["pb"]),
-            (ps_ratio, price_t["ps"]),
-        ]
-        total_fields += len(thresholds)
-        available_fields += sum(metric is not None for metric, _ in thresholds)
-        price_ratio_score = sum(metric is not None and metric > threshold for metric, threshold in thresholds)
-
-        signals.append("bearish" if price_ratio_score >= 2 else "bullish" if price_ratio_score == 0 else "neutral")
+        price = aggregate([
+            signed_score(pe_ratio, price_t["pe"], higher_is_better=False),
+            signed_score(pb_ratio, price_t["pb"], higher_is_better=False),
+            signed_score(ps_ratio, price_t["ps"], higher_is_better=False),
+        ])
+        pillar_scores.append(price.score if price.coverage else None)
+        pillar_weights.append(1.0)
         reasoning["price_ratios_signal"] = {
-            "signal": signals[3],
+            "signal": price.signal,
+            "score": round(price.score, 3),
             "details": (f"P/E: {pe_ratio:.2f}" if pe_ratio else "P/E: N/A") + ", " + (f"P/B: {pb_ratio:.2f}" if pb_ratio else "P/B: N/A") + ", " + (f"P/S: {ps_ratio:.2f}" if ps_ratio else "P/S: N/A"),
         }
 
         progress.update_status(agent_id, ticker, "Calculating final signal")
-        # Determine overall signal
-        bullish_signals = signals.count("bullish")
-        bearish_signals = signals.count("bearish")
-
-        if bullish_signals > bearish_signals:
-            overall_signal = "bullish"
-        elif bearish_signals > bullish_signals:
-            overall_signal = "bearish"
-        else:
-            overall_signal = "neutral"
-
-        # Calculate confidence level, then scale it by data coverage so a read
-        # built on partial data is presented with lower conviction.
-        total_signals = len(signals)
-        base_confidence = max(bullish_signals, bearish_signals) / total_signals
-        coverage = (available_fields / total_fields) if total_fields else 1.0
-        confidence = round(base_confidence * coverage * 100)
+        # Overall: weighted mean of the available pillar scores. Sign is the
+        # signal; magnitude is conviction; coverage scales confidence down when
+        # whole pillars were missing.
+        overall = aggregate(pillar_scores, pillar_weights)
+        confidence = round(overall.confidence * 100)
 
         reasoning["data_coverage"] = {
             "sector": sector,
-            "fields_available": available_fields,
-            "fields_total": total_fields,
-            "coverage": f"{coverage:.0%}",
+            "pillars_available": sum(s is not None for s in pillar_scores),
+            "pillars_total": len(pillar_scores),
+            "coverage": f"{overall.coverage:.0%}",
+            "net_score": round(overall.score, 3),
         }
 
         fundamental_analysis[ticker] = {
-            "signal": overall_signal,
+            "signal": overall.signal,
             "confidence": confidence,
             "reasoning": reasoning,
         }
