@@ -1,0 +1,23 @@
+# Render Blueprint for the PYTHON DATA BRIDGE (scripts/agent_bridge.py).
+#
+# Push this repo to GitHub, then in Render: New > Blueprint, point it at the repo.
+# Render builds the Dockerfile at the repo root and runs the bridge. Fill the env
+# vars marked `sync: false` in the dashboard.
+#
+# Docs: https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: stock-data-bridge
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      # Required: data source for US/foreign fundamentals.
+      # Get one at https://financialdatasets.ai
+      - key: FINANCIAL_DATASETS_API_KEY
+        sync: false
+      # Shared secret — MUST equal BRIDGE_TOKEN on the Nuxt service. Only callers
+      # presenting this token may hit /financials.
+      - key: BRIDGE_TOKEN
+        sync: false
