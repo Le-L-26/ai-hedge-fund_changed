@@ -96,7 +96,11 @@ _KEY_METRICS = [
 _TREND_METRICS = ["revenue_growth", "earnings_growth", "net_margin", "return_on_equity"]
 
 
-@app.get("/health")
+# Accept HEAD as well as GET: UptimeRobot (and most uptime pingers) probe with a
+# HEAD request by default. FastAPI's @app.get registers ONLY GET, so a HEAD probe
+# was getting 405 Method Not Allowed -> the monitor reported the bridge as DOWN
+# even though it was healthy. api_route with both verbs fixes that.
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health() -> dict:
     return {"ok": True}
 
